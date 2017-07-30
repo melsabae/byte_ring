@@ -141,7 +141,7 @@ inline static void br_write_byte(byte_ring_t* ring, uint8_t byte)
 	
 	*(ring->write + size) = byte;
 	
-	br_set_size(ring, index, size + 1);
+	br_set_size(ring, index, size + sizeof(byte));
 }
 
 inline static void br_move_read_line_forward(byte_ring_t* ring)
@@ -513,14 +513,14 @@ bool br_cinch(byte_ring_t* ring, uint8_t byte)
 	size_t size = br_get_size(ring, ring->write);
 	//size_t index = br_get_size_map_index(ring, ring->write);
 	
-	if((ring->line_length - size - 1 > ring->line_length)
-		|| (ring->line_length - size - 1 < 0))
+	if((ring->line_length - size - sizeof(byte) > ring->line_length)
+		|| (ring->line_length - size - sizeof(byte) < 0))
 	{
 		return ring->push_function(ring, byte);
 	}
 	
 	// block overwrite with byte for however many is left, without the last one
-	memset(ring->write + size, (int) byte, (ring->line_length - size - 1) * sizeof(uint8_t));
+	memset(ring->write + size, (int) byte, (ring->line_length - size - sizeof(byte)) * sizeof(byte));
 	
 	// don't adjust the counter, since this is dummy data
 	// leave a space for the final push
