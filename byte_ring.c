@@ -27,7 +27,7 @@ struct byte_ring
 
 inline static size_t br_get_backing_store_size(byte_ring_t* ring)
 {
-	return ring->backing_store_size;
+	return (ring->backing_store_size);
 }
 
 inline static uint8_t* br_get_first_line(byte_ring_t* ring)
@@ -37,38 +37,38 @@ inline static uint8_t* br_get_first_line(byte_ring_t* ring)
 
 inline static uint8_t* br_get_final_line(byte_ring_t* ring)
 {
-	uint8_t* first_line = br_get_first_line(ring);
-	size_t size = br_get_backing_store_size(ring);
-	uint8_t* final_line = first_line + size - (ring->line_length);
-	return final_line;
+	// take the first line, go to the last byte, move back by a line's length
+	return (br_get_first_line(ring) + br_get_backing_store_size(ring) - (ring->line_length));
 }
 
-inline static uint8_t* br_get_exact_line(byte_ring_t* ring, size_t index)
+inline static uint8_t* br_get_specific_line(byte_ring_t* ring, size_t index)
 {
-	uint8_t* first_line = br_get_first_line(ring);
-	size_t offset = index * ring->line_length;
-	return first_line + offset;
+	return (br_get_first_line(ring) + (index * ring->line_length));
+}
+
+inline static size_t br_get_line_index(byte_ring_t* ring, uint8_t* head)
+{
+	return ((size_t) (head - br_get_first_line(ring)));
 }
 
 inline static uint8_t* br_get_next_line(byte_ring_t* ring, uint8_t* head)
 {
-	uint8_t* first = br_get_first_line(ring);
 	const uint8_t* final = br_get_final_line(ring);
-
-	if(final == head) { return first; }
-	return (head + ring->line_length);
-}
-
-inline static size_t br_get_size_map_index(byte_ring_t* ring, uint8_t* head)
-{
-	uintptr_t index = head - br_get_first_line(ring);
-	return (size_t) index;
+	uint8_t* function_value = NULL;
+	
+	// if this line is at the end, go back to the beginning
+	if(final == head) { function_value = br_get_first_line(ring); }
+		
+	// if this line is not at the end, move forward by a line length from where it currently is
+	if(final != head) {	function_value = head + ring->line_length; }
+	
+	return (function_value);
 }
 
 inline static size_t br_get_size(byte_ring_t* ring, uint8_t* head)
 {
-	size_t index = br_get_size_map_index(ring, head);
-	return (ring->size_map)[index];
+	size_t index = br_get_line_index(ring, head);
+	return ((ring->size_map)[index]);
 }
 
 inline static void br_set_size(byte_ring_t* ring, size_t index, size_t size)
@@ -78,22 +78,28 @@ inline static void br_set_size(byte_ring_t* ring, size_t index, size_t size)
 
 inline static bool br_write_line_is_full(byte_ring_t* ring)
 {
-	if(ring->line_length <= br_get_size(ring, ring->write)) { return true; }
-	return false;
+	bool function_value = false;
+	if(ring->line_length <= br_get_size(ring, ring->write)) { function_value = true; }
+	return (function_value);
+}
+
+inline static bool br_head1_will_point_to_head2(byte_ring_t* ring, uint8_t* head1, uint8_t* head2)
+{
+	bool function_value = false;
+	if(br_get_next_line(ring, head1) == head2) { function_value = true; }
+	return (function_value);
 }
 
 // if this function returns true, the byte_ring is full
 inline static bool br_write_will_point_to_read(byte_ring_t* ring)
 {
-	if(br_get_next_line(ring, ring->write) == ring->read) { return true; }
-	return false;
+	return (br_head1_will_point_to_head2(ring, ring->write, ring->read));
 }
 
 // if this function returns true, the byte_ring is empty
 inline static bool br_read_will_point_to_write(byte_ring_t* ring)
 {
-	if(br_get_next_line(ring, ring->read) == ring->write) { return true; }
-	return false;
+	return (br_head1_will_point_to_head2(ring, ring->read, ring->write));
 }
 
 static void br_check_truths(byte_ring_t* ring)
@@ -115,13 +121,13 @@ static void br_check_truths(byte_ring_t* ring)
 
 inline static void br_reset_write_head(byte_ring_t* ring)
 {
-	size_t index = br_get_size_map_index(ring, ring->write);
+	size_t index = br_get_line_index(ring, ring->write);
 	br_set_size(ring, index, 0);
 }
 
 inline static void br_reset_read_head(byte_ring_t* ring)
 {
-	size_t index = br_get_size_map_index(ring, ring->read);
+	size_t index = br_get_line_index(ring, ring->read);
 	br_set_size(ring, index, 0);
 	
 #	ifdef BR_SHRED_OLD_DATA
@@ -137,7 +143,7 @@ inline static void br_reset_read_head(byte_ring_t* ring)
 inline static void br_write_byte(byte_ring_t* ring, uint8_t byte)
 {
 	size_t size = br_get_size(ring, ring->write);
-	size_t index = br_get_size_map_index(ring, ring->write);
+	size_t index = br_get_line_index(ring, ring->write);
 	
 	*(ring->write + size) = byte;
 	
@@ -155,7 +161,7 @@ inline static void br_move_write_line_forward(byte_ring_t* ring)
 {
 	// store the size of the written data into the size map
 	// before moving to the next line
-	size_t index = br_get_size_map_index(ring, ring->write);
+	size_t index = br_get_line_index(ring, ring->write);
 	br_set_size(ring, index, br_peek_write_size(ring));
 
 	ring->write = br_get_next_line(ring, ring->write);
@@ -202,7 +208,7 @@ static bool br_push_overwrite_oldest(byte_ring_t* ring, uint8_t byte)
 
 	br_write_byte(ring, byte);
 	br_check_truths(ring);
-	return true;
+	return (true);
 }
 
 // return true == push_success, always returns true
@@ -224,7 +230,7 @@ static bool br_push_overwrite_newest(byte_ring_t* ring, uint8_t byte)
 
 	br_write_byte(ring, byte);
 	br_check_truths(ring);
-	return true;
+	return (true);
 }
 
 // returns true == push_success, when ring was not full
@@ -516,7 +522,7 @@ bool br_cinch(byte_ring_t* ring, uint8_t byte)
 	if((ring->line_length - size - sizeof(byte) > ring->line_length)
 		|| (ring->line_length - size - sizeof(byte) < 0))
 	{
-		return ring->push_function(ring, byte);
+		goto function_exit;
 	}
 	
 	// block overwrite with byte for however many is left, without the last one
@@ -527,6 +533,7 @@ bool br_cinch(byte_ring_t* ring, uint8_t byte)
 	//br_set_size(ring, index, ring->line_length - 1);
 	
 	// then try to increment head according to behavior with the final byte being pushed
+function_exit:
 	return ring->push_function(ring, byte);
 }
 
@@ -575,7 +582,7 @@ bool br_seek(byte_ring_t* ring)
 	switch(ring->behavior)
 	{
 		case BR_OVERWRITE_REFUSAL:
-			return false;
+			goto function_exit;
 			break;
 
 		case BR_OVERWRITE_NEWEST:
@@ -585,10 +592,11 @@ bool br_seek(byte_ring_t* ring)
 
 		case BR_OVERWRITE_OLDEST:
 			//br_reset_read_head(ring);
-			return false;
+			goto function_exit;
 			break;
 	}
-
+	
+function_exit:
 	return false;
 }
 
