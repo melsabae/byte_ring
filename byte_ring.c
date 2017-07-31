@@ -6,15 +6,24 @@
 #	include <assert.h>
 #endif
 
-#define BR_BACKING_STORE_ALLOC	(1 << 0)
-#define BR_STRUCT_ALLOC					(1 << 1)
-#define BR_SIZEMAP_ALLOC				(1 << 2)
+#define BR_BACKING_STORE_ALLOC			(1 << 3)
+#define BR_STRUCT_ALLOC					(1 << 4)
+#define BR_SIZEMAP_ALLOC				(1 << 5)
+
+#define BR_BEHAVIOR_FLAGS_MASK			(BR_OVERWRITE_OLDEST	|	BR_OVERWRITE_NEWEST	|	BR_OVERWRITE_REFUSAL)
+#define BR_ALLOC_FLAGS_MASK				(BR_BACKING_STORE_ALLOC	|	BR_STRUCT_ALLOC		|	BR_SIZEMAP_ALLOC)
+#define BR_IMMUTABLE_FLAGS_MASK			(BR_ALLOC_FLAGS_MASK	|	BR_BEHAVIOR_FLAGS_MASK)
+#define BR_EVENT_FLAGS_MASK				(~BR_IMMUTABLE_FLAGS_MASK)
+
+/*
+// the ring automatically wrapped a line when a line became full
+BR_FLAG_LINE_WRAPPED	=		(1 << 8),
+*/
 
 struct byte_ring
 {
-	BR_AUTO_OVERWRITE_BEHAVIOR behavior;
+	uint32_t								bit_flags;
 	bool (*push_function)(struct byte_ring*, uint8_t);
-	uint8_t									alloc_map;
 	size_t									number_lines;
 	size_t									line_length;
 	uint8_t*								backing_store;
@@ -24,6 +33,38 @@ struct byte_ring
 	uint8_t*								write;
 	uint8_t*								read;
 };
+
+inline static uint32_t _br_get_flags(byte_ring_t* ring)
+{
+	return (ring->bit_flags);
+}
+
+inline static void _br_set_flags(byte_ring_t* ring, uint32_t flags)
+{
+	ring->bit_flags = flags;
+}
+
+inline static void _br_add_flags(byte_ring_t* ring, uint32_t flags)
+{
+	ring->bit_flags |= flags;
+}
+
+inline static void _br_clear_flag(byte_ring_t* ring, uint32_t flag)
+{
+	uint32_t flags = _br_get_flags(ring) & ~(flag);
+	_br_set_flags(ring, flags);
+}
+
+inline static void _br_clear_event_flags(byte_ring_t* ring)
+{
+	uint32_t flags = _br_get_flags(ring) & BR_IMMUTABLE_FLAGS_MASK;
+	_br_set_flags(ring, flags);
+}
+
+inline static bool _br_flag_is_set(byte_ring_t* ring, BR_EVENT_FLAGS event_flag)
+{
+	return (0 != (_br_get_flags(ring) & event_flag));
+}
 
 inline static size_t br_get_backing_store_size(byte_ring_t* ring)
 {
@@ -79,11 +120,16 @@ inline static void br_set_size(byte_ring_t* ring, size_t index, size_t size)
 inline static bool br_write_line_is_full(byte_ring_t* ring)
 {
 	bool function_value = false;
-	if(ring->line_length <= br_get_size(ring, ring->write)) { function_value = true; }
+	if(ring->line_length <= br_get_size(ring, ring->write))
+	{
+		function_value = true;
+		_br_add_flags(ring, BR_FLAG_LINE_WRAPPED);
+	}
+	
 	return (function_value);
 }
 
-inline static bool br_head1_will_point_to_head2(byte_ring_t* ring, uint8_t* head1, uint8_t* head2)
+inline static bool br_head1_will_point_to_head2(byte_ring_t* ring, uint8_t* restrict head1, uint8_t* restrict head2)
 {
 	bool function_value = false;
 	if(br_get_next_line(ring, head1) == head2) { function_value = true; }
@@ -93,13 +139,17 @@ inline static bool br_head1_will_point_to_head2(byte_ring_t* ring, uint8_t* head
 // if this function returns true, the byte_ring is full
 inline static bool br_write_will_point_to_read(byte_ring_t* ring)
 {
-	return (br_head1_will_point_to_head2(ring, ring->write, ring->read));
+	bool clobber = br_head1_will_point_to_head2(ring, ring->write, ring->read);
+	if(true == clobber) { _br_add_flags(ring, BR_FLAG_RING_FULL); }
+	return (clobber);
 }
 
 // if this function returns true, the byte_ring is empty
 inline static bool br_read_will_point_to_write(byte_ring_t* ring)
 {
-	return (br_head1_will_point_to_head2(ring, ring->read, ring->write));
+	bool clobber = br_head1_will_point_to_head2(ring, ring->read, ring->write);
+	if(true == clobber) { _br_add_flags(ring, BR_FLAG_RING_EMPTY); }
+	return (clobber);
 }
 
 static void br_check_truths(byte_ring_t* ring)
@@ -199,6 +249,7 @@ static bool br_push_overwrite_oldest(byte_ring_t* ring, uint8_t byte)
 	if(true == overwrite)
 	{
 		br_move_read_line_forward(ring);
+		_br_add_flags(ring, BR_FLAG_OVERWRITE);
 	}
 
 	if(true == full)
@@ -221,6 +272,7 @@ static bool br_push_overwrite_newest(byte_ring_t* ring, uint8_t byte)
 	if(true == overwrite)
 	{
 		br_reset_write_head(ring);
+		_br_add_flags(ring, BR_FLAG_OVERWRITE);
 	}
 
 	if((false == overwrite) && (true == full))
@@ -241,8 +293,16 @@ static bool br_push_refuse_overwrite(byte_ring_t* ring, uint8_t byte)
 	bool full						=	br_write_line_is_full(ring);
 	bool overwrite			= clobber && full;
 
-	if(true == overwrite) { goto fail_early; }
-	if(true == full) { br_move_write_line_forward(ring); }
+	if(true == overwrite)
+	{
+		goto fail_early;
+	}
+		
+	if(true == full)
+	{
+		br_move_write_line_forward(ring);
+	}
+	
 	br_write_byte(ring, byte);
 fail_early:
 	br_check_truths(ring);
@@ -250,7 +310,7 @@ fail_early:
 }
 
 byte_ring_t* br_create_full_alloc(size_t n_lines, size_t len_lines,
-		BR_AUTO_OVERWRITE_BEHAVIOR behavior)
+		BR_BEHAVIOR_FLAGS behavior_flag)
 {
 	size_t size								= len_lines * n_lines;
 	byte_ring_t* ring					= (byte_ring_t*) malloc(sizeof(byte_ring_t));
@@ -278,14 +338,11 @@ byte_ring_t* br_create_full_alloc(size_t n_lines, size_t len_lines,
 	ring->backing_store_size	= size;
 	ring->number_lines				= n_lines;
 	ring->line_length					= len_lines;
-	ring->behavior						=	behavior;
+	
+	_br_set_flags(ring, 0);
+	_br_add_flags(ring, BR_BACKING_STORE_ALLOC | BR_STRUCT_ALLOC | BR_SIZEMAP_ALLOC | behavior_flag);
 
-	ring->alloc_map					=	BR_BACKING_STORE_ALLOC
-		| BR_STRUCT_ALLOC
-		| BR_SIZEMAP_ALLOC;
-
-
-	switch(behavior)
+	switch(behavior_flag)
 	{
 		case BR_OVERWRITE_OLDEST:
 			ring->push_function = br_push_overwrite_oldest;
@@ -309,7 +366,7 @@ fail_early:
 }
 
 byte_ring_t* br_create_alloc_static_backing_store(size_t n_lines,
-		size_t len_lines, BR_AUTO_OVERWRITE_BEHAVIOR behavior,
+		size_t len_lines, BR_BEHAVIOR_FLAGS behavior_flag,
 		uint8_t* backing_store)
 {
 	byte_ring_t* ring					= (byte_ring_t*) malloc(sizeof(byte_ring_t));
@@ -328,10 +385,11 @@ byte_ring_t* br_create_alloc_static_backing_store(size_t n_lines,
 	ring->backing_store_size	= n_lines * len_lines;
 	ring->number_lines				= n_lines;
 	ring->line_length					= len_lines;
-	ring->behavior						=	behavior;
-	ring->alloc_map						=	BR_STRUCT_ALLOC | BR_SIZEMAP_ALLOC;
+	
+	_br_set_flags(ring, 0);
+	_br_add_flags(ring, BR_STRUCT_ALLOC | BR_SIZEMAP_ALLOC | behavior_flag);
 
-	switch(behavior)
+	switch(behavior_flag)
 	{
 		case BR_OVERWRITE_OLDEST:
 			ring->push_function = br_push_overwrite_oldest;
@@ -355,15 +413,16 @@ fail_early:
 }
 
 int br_alloc_full_static(byte_ring_t* ring, size_t n_lines, size_t len_lines,
-		BR_AUTO_OVERWRITE_BEHAVIOR behavior, uint8_t* backing_store)
+		BR_BEHAVIOR_FLAGS behavior_flag, uint8_t* backing_store)
 {
 	int function_value				=	-1;
 	ring->backing_store				= backing_store;
 	ring->backing_store_size	= n_lines * len_lines;
-	ring->alloc_map						=	BR_SIZEMAP_ALLOC;
 	ring->number_lines				= n_lines;
 	ring->line_length					= len_lines;
-	ring->behavior						=	behavior;
+	
+	_br_set_flags(ring, 0);
+	_br_add_flags(ring, BR_SIZEMAP_ALLOC | behavior_flag);
 
 	size_t* size_map					= (size_t*) malloc(sizeof(size_t) * n_lines);
 	if(NULL == size_map)
@@ -372,7 +431,7 @@ int br_alloc_full_static(byte_ring_t* ring, size_t n_lines, size_t len_lines,
 	}
 
 	ring->size_map						=	size_map;
-	switch(behavior)
+	switch(behavior_flag)
 	{
 		case BR_OVERWRITE_OLDEST:
 			ring->push_function = br_push_overwrite_oldest;
@@ -398,7 +457,7 @@ function_exit:
 
 void br_destroy_internals(byte_ring_t* ring)
 {
-	uint8_t alloc_map = ring->alloc_map;
+	uint32_t alloc_map = _br_get_flags(ring) & BR_ALLOC_FLAGS_MASK;
 	uint8_t* backing_store = br_get_first_line(ring);
 
 	if(BR_BACKING_STORE_ALLOC & alloc_map)
@@ -418,7 +477,7 @@ void br_destroy(byte_ring_t** ring)
 {
 	br_destroy_internals(*ring);
 
-	uint8_t alloc_map = (*ring)->alloc_map;
+	uint32_t alloc_map = _br_get_flags(*ring) & BR_ALLOC_FLAGS_MASK;
 	if(BR_STRUCT_ALLOC & alloc_map) { free(*ring); *ring = NULL; }
 }
 
@@ -514,90 +573,98 @@ bool br_push(byte_ring_t* ring, uint8_t byte)
 	return (ring->push_function(ring, byte));
 }
 
-bool br_cinch(byte_ring_t* ring, uint8_t byte)
-{
-	size_t size = br_get_size(ring, ring->write);
-	//size_t index = br_get_size_map_index(ring, ring->write);
-	
-	if((ring->line_length - size - sizeof(byte) > ring->line_length)
-		|| (ring->line_length - size - sizeof(byte) < 0))
-	{
-		goto function_exit;
-	}
-	
-	// block overwrite with byte for however many is left, without the last one
-	memset(ring->write + size, (int) byte, (ring->line_length - size - sizeof(byte)) * sizeof(byte));
-	
-	// don't adjust the counter, since this is dummy data
-	// leave a space for the final push
-	//br_set_size(ring, index, ring->line_length - 1);
-	
-	// then try to increment head according to behavior with the final byte being pushed
-function_exit:
-	return ring->push_function(ring, byte);
-}
-
-bool br_cinch00(byte_ring_t* ring)
-{
-	return br_cinch(ring, 0x00);
-}
-
-bool br_cinchFF(byte_ring_t* ring)
-{
-	return br_cinch(ring, 0xFF);
-}
+//bool br_cinch(byte_ring_t* ring, uint8_t byte)
+//{
+//	size_t size = br_get_size(ring, ring->write);
+//	//size_t index = br_get_size_map_index(ring, ring->write);
+//	
+//	if((ring->line_length - size - sizeof(byte) > ring->line_length)
+//		|| (ring->line_length - size - sizeof(byte) < 0))
+//	{
+//		goto function_exit;
+//	}
+//	
+//	// block overwrite with byte for however many is left, without the last one
+//	memset(ring->write + size, (int) byte, (ring->line_length - size - sizeof(byte)) * sizeof(byte));
+//	
+//	// don't adjust the counter, since this is dummy data
+//	// leave a space for the final push
+//	//br_set_size(ring, index, ring->line_length - 1);
+//	
+//	// then try to increment head according to behavior with the final byte being pushed
+//function_exit:
+//	return ring->push_function(ring, byte);
+//}
+//
+//bool br_cinch00(byte_ring_t* ring)
+//{
+//	return br_cinch(ring, 0x00);
+//}
+//
+//bool br_cinchFF(byte_ring_t* ring)
+//{
+//	return br_cinch(ring, 0xFF);
+//}
 
 bool br_advance_write_head(byte_ring_t* ring)
 {
-	bool clobber		= br_write_will_point_to_read(ring);
-	bool full				=	br_write_line_is_full(ring);
-	bool overwrite	= clobber && full;
+	bool clobber			= br_write_will_point_to_read(ring);
+	bool full				= br_write_line_is_full(ring);
+	bool overwrite			= clobber && full;
+	bool function_value		= false;
 	
-	switch(ring->behavior)
+	if(false == overwrite)
 	{
-		case BR_OVERWRITE_OLDEST:
-		if(true == overwrite) { br_move_read_line_forward(ring); br_move_write_line_forward(ring); return true; }
-		break;
-		
-		case BR_OVERWRITE_NEWEST:
-		if(true == overwrite) { br_reset_write_head(ring); return true; }
-		break;
-		
-		case BR_OVERWRITE_REFUSAL:
-		if(true == overwrite) { return false; }
-		break;
+		br_move_write_line_forward(ring);
+		function_value = true;
 	}
+		
+	if(true == overwrite)
+	{
+		switch(_br_get_flags(ring) & BR_BEHAVIOR_FLAGS_MASK)
+		{
+				case BR_OVERWRITE_OLDEST:
+					{
+						br_move_read_line_forward(ring);
+						br_move_write_line_forward(ring);
+						_br_add_flags(ring, BR_FLAG_OVERWRITE);
+						function_value = true;
+					}
+				break;
+				
+				case BR_OVERWRITE_NEWEST:
+					{
+						br_reset_write_head(ring);
+						_br_add_flags(ring, BR_FLAG_OVERWRITE);
+						function_value = true;
+					}
+				break;
+				
+				case BR_OVERWRITE_REFUSAL:
+					{
+						function_value = false;
+					}
+				break;
+		}
+	}	
 	
-	// if overwriting did not need to happen, move the write line forward
-	br_move_write_line_forward(ring);
-	return true;
+	_br_add_flags(ring, BR_FLAG_DATA_READY);
+	return (function_value);
 }
 
 bool br_seek(byte_ring_t* ring)
 {
+	bool function_value = false;
 	br_reset_read_head(ring);
 	bool clobber = br_read_will_point_to_write(ring);
-	if(false == clobber) { br_move_read_line_forward(ring); return true;}
-
-	switch(ring->behavior)
+	
+	if(false == clobber)
 	{
-		case BR_OVERWRITE_REFUSAL:
-			goto function_exit;
-			break;
-
-		case BR_OVERWRITE_NEWEST:
-			br_move_write_line_forward(ring);
-			br_move_read_line_forward(ring);
-			break;
-
-		case BR_OVERWRITE_OLDEST:
-			//br_reset_read_head(ring);
-			goto function_exit;
-			break;
+		br_move_read_line_forward(ring);
+		function_value = true;
 	}
 	
-function_exit:
-	return false;
+	return (function_value);
 }
 
 void br_clear(byte_ring_t* ring)
@@ -612,7 +679,25 @@ void br_clear(byte_ring_t* ring)
 	br_reset_read_head(ring);
 	br_reset_write_head(ring);
 
+	_br_clear_event_flags(ring);
 	br_check_truths(ring);
+}
+
+void br_set_flag(byte_ring_t* ring, BR_EVENT_FLAGS event_flag)
+{
+	uint32_t new_flags = _br_get_flags(ring) | (event_flag & BR_EVENT_FLAGS_MASK);
+	_br_add_flags(ring, new_flags);
+}
+
+void br_clear_flag(byte_ring_t* ring, BR_EVENT_FLAGS event_flag)
+{
+	_br_clear_flag(ring, event_flag & BR_EVENT_FLAGS_MASK);
+}
+
+bool br_flag_is_set(byte_ring_t* ring, BR_EVENT_FLAGS event_flag)
+{
+	uint32_t flags = _br_get_flags(ring);
+	return (0 != (event_flag & flags));
 }
 
 ssize_t br_pop(byte_ring_t* ring, uint8_t* dst, br_ready_for_pop f)
